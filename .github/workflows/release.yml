@@ -1,0 +1,181 @@
+name: Build & Release AppImage
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-appimage:
+    name: Build AppImage (Linux x86_64)
+    runs-on: ubuntu-22.04
+
+    steps:
+      # ── 1. Checkout ──────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # needed for changelog generation
+
+      # ── 2. Extract version from tag ──────────────────────────────────────────
+      - name: Set version env var
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+
+      # ── 3. Setup Python 3.11 ─────────────────────────────────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      # ── 4. Install system dependencies ───────────────────────────────────────
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            libfuse2 \
+            libglib2.0-0 \
+            libx11-6 \
+            libxext6 \
+            librsvg2-bin \
+            imagemagick \
+            desktop-file-utils \
+            fuse
+
+      # ── 5. Install Python dependencies ───────────────────────────────────────
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      # ── 6. Download appimagetool ─────────────────────────────────────────────
+      - name: Download appimagetool
+        run: |
+          wget -q "https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage" \
+               -O /usr/local/bin/appimagetool
+          chmod +x /usr/local/bin/appimagetool
+
+      # ── 7. Convert SVG logo to PNG icons ─────────────────────────────────────
+      - name: Generate PNG icons from SVG
+        run: |
+          mkdir -p assets
+          rsvg-convert -w 256 -h 256 assets/logo_256.svg -o assets/logo_256.png || \
+          convert -background none -resize 256x256 assets/logo.svg assets/logo_256.png || \
+          python -c "
+          from PIL import Image
+          img = Image.new('RGBA', (256,256), (13,13,13,255))
+          img.save('assets/logo_256.png')
+          "
+
+      # ── 8. Build with PyInstaller ─────────────────────────────────────────────
+      - name: Build with PyInstaller
+        run: |
+          pyinstaller \
+            --onefile \
+            --windowed \
+            --name tsumi \
+            --add-data "assets:assets" \
+            --add-data "sources:sources" \
+            --icon assets/logo_256.png \
+            Main.py
+
+      # ── 9. Assemble AppDir ───────────────────────────────────────────────────
+      - name: Assemble AppDir
+        run: |
+          APP_DIR="AppDir"
+          mkdir -p "$APP_DIR/usr/bin"
+          mkdir -p "$APP_DIR/usr/share/applications"
+          mkdir -p "$APP_DIR/usr/share/icons/hicolor/256x256/apps"
+          mkdir -p "$APP_DIR/usr/share/icons/hicolor/scalable/apps"
+
+          # Binary
+          cp dist/tsumi "$APP_DIR/usr/bin/tsumi"
+          chmod +x "$APP_DIR/usr/bin/tsumi"
+
+          # Desktop file
+          cp tsumi.desktop "$APP_DIR/usr/share/applications/tsumi.desktop"
+          cp tsumi.desktop "$APP_DIR/tsumi.desktop"
+
+          # Icons
+          cp assets/logo_256.png "$APP_DIR/usr/share/icons/hicolor/256x256/apps/tsumi.png"
+          cp assets/logo.svg     "$APP_DIR/usr/share/icons/hicolor/scalable/apps/tsumi.svg"
+          cp assets/logo_256.png "$APP_DIR/tsumi.png"
+
+          # AppRun symlink / wrapper
+          cat > "$APP_DIR/AppRun" << 'EOF'
+          #!/bin/bash
+          HERE="$(dirname "$(readlink -f "${0}")")"
+          exec "$HERE/usr/bin/tsumi" "$@"
+          EOF
+          chmod +x "$APP_DIR/AppRun"
+
+      # ── 10. Build AppImage ───────────────────────────────────────────────────
+      - name: Build AppImage
+        env:
+          ARCH: x86_64
+        run: |
+          mkdir -p dist
+          appimagetool AppDir "dist/Tsumi-${{ env.VERSION }}-x86_64.AppImage"
+
+      # ── 11. Generate release notes from CHANGELOG ────────────────────────────
+      - name: Extract release notes
+        id: changelog
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          VERSION_CLEAN="${TAG#v}"
+
+          # Try to extract section for this version from CHANGELOG.md
+          if [ -f CHANGELOG.md ]; then
+            NOTES=$(awk "/^## \[?${VERSION_CLEAN}\]?/,/^## \[?[0-9]/" CHANGELOG.md \
+                    | head -n -1 | tail -n +2)
+          fi
+
+          if [ -z "$NOTES" ]; then
+            # Fallback: list commits since previous tag
+            PREV_TAG=$(git describe --abbrev=0 --tags "${TAG}^" 2>/dev/null || echo "")
+            if [ -n "$PREV_TAG" ]; then
+              NOTES=$(git log --pretty=format:"- %s" "${PREV_TAG}..${TAG}")
+            else
+              NOTES="Initial release."
+            fi
+          fi
+
+          # Append co-authorship footer
+          cat >> /dev/null << 'COAUTH'
+
+---
+Co-authored-by: Claude <claude@anthropic.com>
+COAUTH
+
+          # Write to file so multiline works with GitHub Actions
+          {
+            echo "$NOTES"
+            echo ""
+            echo "---"
+            echo "Co-authored-by: Claude <claude@anthropic.com>"
+          } > release_notes.md
+          echo "notes_file=release_notes.md" >> "$GITHUB_OUTPUT"
+
+      # ── 12. Configure git identity ───────────────────────────────────────────
+      - name: Configure git identity
+        run: |
+          git config user.name  "Badley08"
+          git config user.email "badley08@users.noreply.github.com"
+
+      # ── 13. Create GitHub Release & upload AppImage ──────────────────────────
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: "Tsumi ${{ github.ref_name }}"
+          body_path: release_notes.md
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          files: |
+            dist/Tsumi-${{ env.VERSION }}-x86_64.AppImage
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

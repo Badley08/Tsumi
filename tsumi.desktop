@@ -1,0 +1,13 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Tsumi
+GenericName=Manga Reader
+Comment=Lecteur de manga, manhwa, manhua et webtoon
+Exec=tsumi %f
+Icon=tsumi
+Terminal=false
+Categories=Graphics;Viewer;
+MimeType=application/x-cbz;application/zip;application/x-cbr;application/x-rar;
+Keywords=manga;manhwa;manhua;webtoon;cbz;cbr;reader;
+StartupWMClass=Tsumi
